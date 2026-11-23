@@ -8,6 +8,9 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -27,6 +30,38 @@
 //
 // llama_context
 //
+
+// collect every plain llama_kv_cache inside a memory module, unwrapping iSWA and hybrid wrappers,
+// so that turbo deferred K quantization (F16 -> planar/iso after prefill) also runs for those models
+[[maybe_unused]] static std::vector<llama_kv_cache *> turbo_collect_kv_caches(llama_memory_i * mem) {
+    std::vector<llama_kv_cache *> res;
+
+    auto add_iswa = [&](llama_kv_cache_iswa * iswa) {
+        if (!iswa) {
+            return;
+        }
+        if (auto * base = iswa->get_base()) {
+            res.push_back(base);
+        }
+        if (auto * swa = iswa->get_swa()) {
+            res.push_back(swa);
+        }
+    };
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        res.push_back(kv);
+    } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        add_iswa(iswa);
+    } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) { // also covers llama_memory_hybrid_idx
+        if (auto * attn = hyb->get_mem_attn()) {
+            res.push_back(attn);
+        }
+    } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        add_iswa(hyb_iswa->get_mem_attn());
+    }
+
+    return res;
+}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -2365,6 +2400,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // Only on CUDA — Metal FA doesn't support mixed planar3/iso3 K + F16 V yet.
 #ifdef GGML_USE_CUDA
         if (ubatch.n_tokens == 1 && memory) {
+            // NOTE: only plain llama_kv_cache memory is converted. Converting the caches inside
+            // iSWA/hybrid memory (turbo_collect_kv_caches) corrupts attention on Qwen3.6 hybrid
+            // (prompt misread, ~4x slower decode), so those keep F16 K until the conversion is fixed.
             auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
             if (kv && kv->convert_deferred_keys()) {
                 sched_need_reserve = true;
@@ -4535,8 +4573,7 @@ llama_context * llama_init_from_model(
          params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 ||
          params.type_v == GGML_TYPE_PLANAR3_0 || params.type_v == GGML_TYPE_ISO3_0 ||
          params.type_v == GGML_TYPE_PLANAR4_0 || params.type_v == GGML_TYPE_ISO4_0)) {
-        LLAMA_LOG_WARN("%s: turbo cache types require flash_attn - enabling automatically
-", __func__);
+        LLAMA_LOG_WARN("%s: turbo cache types require flash_attn - enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
