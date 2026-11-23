@@ -348,6 +348,33 @@ struct llm_build_jamba : public llm_build_mamba_base {
     llm_build_jamba(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_gptx3 : public llm_graph_context {
+    llm_build_gptx3(const llama_model & model, const llm_graph_params & params);
+private:
+    ggml_tensor * build_layer_attn(
+    llm_graph_input_attn_kv * inp,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                        int   il);
+
+    ggml_tensor * build_layer_gdn2(
+         llm_graph_input_rs * inp,
+                ggml_tensor * cur,
+                        int   il);
+
+    ggml_tensor * build_gdn2_conv(
+                ggml_tensor * conv_states_all,
+                ggml_tensor * conv_state_all,
+                    int64_t   qkv,
+                ggml_tensor * x,
+                ggml_tensor * proj_w,
+                ggml_tensor * conv_w,
+                    int64_t   kv_head,
+                        int   il);
+
+    const llama_model & model;
+};
+
 struct llm_build_kimi_linear : public llm_build_delta_net_base {
     llm_build_kimi_linear(const llama_model & model, const llm_graph_params & params);
 

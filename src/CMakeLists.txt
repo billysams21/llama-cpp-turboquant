@@ -77,6 +77,7 @@ add_library(llama
             models/glm4.cpp
             models/gpt2.cpp
             models/gptneox.cpp
+            models/gptx3.cpp
             models/granite-hybrid.cpp
             models/granite.cpp
             models/grok.cpp

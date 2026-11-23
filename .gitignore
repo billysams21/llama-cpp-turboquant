@@ -143,3 +143,9 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+bench-smem-m5-baseline.txt
+bench-smem-m5-smem.txt
+ggml/src/ggml-cuda/set-rows-planar-iso.cuh
+ggml/src/ggml-cuda/cpy-planar-iso.cuh
+ggml/src/ggml-cuda/planar-iso-constants.cuh
+ggml/src/ggml-cuda/cpy-planar-iso.cu

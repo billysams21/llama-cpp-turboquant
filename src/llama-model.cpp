@@ -2531,6 +2531,23 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_GPTX3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_GROUPNORM_EPS,     hparams.f_norm_group_eps); // GDN2 o_norm eps
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);   // GDN2 head dim
+
+                // GDN2 layers are marked with n_head_kv == 0
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+                }
+
+                switch (hparams.n_layer) {
+                    case 24: type = LLM_TYPE_149M; break; // GPT-X3-150M
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_STEP35:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -7092,6 +7109,73 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     }
                 } break;
+            case LLM_ARCH_GPTX3:
+                {
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    // output
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+
+                    // tied embeddings
+                    if (output == NULL) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    const int64_t gdn_head_dim = hparams.n_embd_head_kda;
+                    const int64_t gdn_n_head   = n_embd / gdn_head_dim;
+                    const int64_t gdn_d_inner  = gdn_head_dim * gdn_n_head;
+                    const int64_t d_conv       = hparams.ssm_d_conv;
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        if (hparams.is_recurrent(i)) {
+                            // GDN2 layer
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, gdn_d_inner}, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, gdn_d_inner}, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, gdn_d_inner}, 0);
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {gdn_d_inner, n_embd}, 0);
+
+                            layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), {d_conv, gdn_d_inner}, 0);
+                            layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", i), {d_conv, gdn_d_inner}, 0);
+                            layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", i), {d_conv, gdn_d_inner}, 0);
+
+                            // decay: f_proj (low-rank) + dt_bias, A = -exp(A_log) per head
+                            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", i), {n_embd, gdn_head_dim}, 0);
+                            layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B, "weight", i), {gdn_head_dim, gdn_d_inner}, 0);
+                            layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT,  "bias",   i), {gdn_d_inner}, 0);
+                            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,      i), {gdn_n_head}, 0);
+
+                            // per-channel erase (b_proj) and write (w_proj) gates
+                            layer.ssm_beta  = create_tensor(tn(LLM_TENSOR_SSM_BETA,  "weight", i), {n_embd, gdn_d_inner}, 0);
+                            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, gdn_d_inner}, 0);
+
+                            // output gate (low-rank, with bias) and per-head RMSNorm
+                            layer.ssm_g_a    = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", i), {n_embd, gdn_head_dim}, 0);
+                            layer.ssm_g_b    = create_tensor(tn(LLM_TENSOR_SSM_G_B, "weight", i), {gdn_head_dim, gdn_d_inner}, 0);
+                            layer.ssm_g_b_b  = create_tensor(tn(LLM_TENSOR_SSM_G_B, "bias",   i), {gdn_d_inner}, 0);
+                            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {gdn_head_dim}, 0);
+                        } else {
+                            // gated GQA layer: q_proj outputs [q | gate] per head
+                            // note: n_head_kv varies per layer (0 for GDN2 layers), so use the per-layer values
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head * 2}, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, hparams.n_embd_k_gqa(i)}, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, hparams.n_embd_v_gqa(i)}, 0);
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+                        }
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                    }
+                } break;
             case LLM_ARCH_COGVLM:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -8781,6 +8865,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_kimi_linear>(*this, params);
             } break;
+        case LLM_ARCH_GPTX3:
+            {
+                llm = std::make_unique<llm_build_gptx3>(*this, params);
+            } break;
         case LLM_ARCH_STEP35:
             {
                 llm = std::make_unique<llm_build_step35_iswa>(*this, params);
@@ -8971,6 +9059,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_GPTX3:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
