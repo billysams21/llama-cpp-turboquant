@@ -32,14 +32,12 @@ static std::vector<float> get_logits(
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
-    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
+    common_batch batch(lctx);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch, tokens[pos], pos, {0}, true);
+        batch.add(tokens[pos], pos, 0, true);
     }
-    batch.n_tokens = n_tokens;
-    if (llama_decode(lctx, batch)) {
-        llama_batch_free(batch);
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         throw std::runtime_error("failed to decode batch");
     }
 
@@ -51,13 +49,15 @@ static std::vector<float> get_logits(
             ret.push_back(logits_ith[j]);
         }
     }
-    llama_batch_free(batch);
     return ret;
 }
 
 int main(int argc, char ** argv) {
     common_params params;
     params.escape = false;
+
+    common_init();
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_RESULTS)) {
         return 1;
     }
@@ -65,7 +65,6 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: an output file must be specified", __func__);
         return 1;
     }
-    common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
     common_init_result_ptr llama_init = common_init_from_params(params);

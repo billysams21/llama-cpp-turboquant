@@ -1,8 +1,8 @@
 #include "models.h"
 
-ggml_cgraph * clip_graph_whisper_enc::build() {
-    const int n_frames = img.nx;
-    const int n_pos    = n_frames / 2;
+ggml_cgraph * mtmd_graph_whisper_enc::build() {
+    const int n_frames = img.nx();
+    const int n_pos    = (n_frames + 1) / 2; // stride-2 conv1d with padding 1
     GGML_ASSERT(model.position_embeddings->ne[1] >= n_pos);
 
     ggml_tensor * inp = build_inp_raw(1);
@@ -77,6 +77,19 @@ ggml_cgraph * clip_graph_whisper_enc::build() {
         cur = build_mm(model.mm_fc_w, cur);
         cur = ggml_add(ctx0, cur, model.mm_fc_b);
 
+    } else if (proj_type == PROJECTOR_TYPE_HIGGS_AUDIO) {
+        // depthwise conv (k=3, s=2, p=1) over time, then linear-relu-linear
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        cur = ggml_conv_1d_dw(ctx0, model.downsample_conv_w, cur, 2, 1, 1);
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        cur = ggml_add(ctx0, cur, model.downsample_conv_b);
+
+        cur = build_mm(model.mm_1_w, cur);
+        cur = ggml_add(ctx0, cur, model.mm_1_b);
+        cur = ggml_relu(ctx0, cur);
+        cur = build_mm(model.mm_2_w, cur);
+        cur = ggml_add(ctx0, cur, model.mm_2_b);
+
     } else if (proj_type == PROJECTOR_TYPE_VOXTRAL) {
         // projector
         cur = build_ffn(cur,
@@ -94,6 +107,28 @@ ggml_cgraph * clip_graph_whisper_enc::build() {
             model.mm_2_w, model.mm_2_b,
             FFN_GELU_ERF,
             -1);
+
+    } else if (proj_type == PROJECTOR_TYPE_MERALION) {
+        // stack (above) -> ln -> linear0+silu -> GLU -> out
+        cur = ggml_norm(ctx0, cur, hparams.eps);
+        cur = ggml_mul(ctx0, cur, model.mm_norm_pre_w);
+        cur = ggml_add(ctx0, cur, model.mm_norm_pre_b);
+
+        cur = ggml_mul_mat(ctx0, model.mm_0_w, cur);
+        cur = ggml_add(ctx0, cur, model.mm_0_b);
+        cur = ggml_silu(ctx0, cur);
+
+        ggml_tensor * gate = ggml_mul_mat(ctx0, model.mm_1_w, cur);
+        gate = ggml_add(ctx0, gate, model.mm_1_b);
+        gate = ggml_silu(ctx0, gate);
+
+        ggml_tensor * pool = ggml_mul_mat(ctx0, model.mm_2_w, cur);
+        pool = ggml_add(ctx0, pool, model.mm_2_b);
+
+        cur = ggml_mul(ctx0, gate, pool);
+
+        cur = ggml_mul_mat(ctx0, model.mm_3_w, cur);
+        cur = ggml_add(ctx0, cur, model.mm_3_b);
 
     } else if (proj_type == PROJECTOR_TYPE_GLMA) {
             cur = ggml_norm(ctx0, cur, hparams.eps);

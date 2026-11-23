@@ -1,14 +1,18 @@
 #pragma once
 
-#define HIP_DISABLE_WARP_SYNC_BUILTINS 1
+#define HIP_ENABLE_WARP_SYNC_BUILTINS 1
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp8.h>
+#include <cstdint>
 
-#if defined(GGML_HIP_ROCWMMA_FATTN)
-#include <rocwmma/rocwmma-version.hpp>
-#endif // defined(GGML_HIP_ROCWMMA_FATTN)
+#ifdef GGML_USE_NCCL
+#include <rccl/rccl.h>
+#endif // GGML_USE_NCCL
+
+typedef uint64_t ggml_cuda_thread_mask_t;
 
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
@@ -28,32 +32,6 @@
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
-// __shfl_sync: support both 3-arg (mask, var, srcLane) and 4-arg (mask, var, srcLane, width) calls
-// HIP ignores the mask but requires it to be 64-bit, so we cast explicitly.
-#define __SHFL_SYNC_3(mask, var, srcLane)        __shfl(var, srcLane, warpSize)
-#define __SHFL_SYNC_4(mask, var, srcLane, width) __shfl(var, srcLane, width)
-#define __SHFL_GET_MACRO(_1, _2, _3, _4, NAME, ...) NAME
-#define __shfl_sync(...) __SHFL_GET_MACRO(__VA_ARGS__, __SHFL_SYNC_4, __SHFL_SYNC_3)(__VA_ARGS__)
-// __shfl_up_sync: support 3-arg and 4-arg calls (HIP ignores mask)
-#define __SHFL_UP_SYNC_3(mask, var, delta)        __shfl_up(var, delta, warpSize)
-#define __SHFL_UP_SYNC_4(mask, var, delta, width) __shfl_up(var, delta, width)
-#define __SHFL_UP_GET(_1, _2, _3, _4, NAME, ...) NAME
-#define __shfl_up_sync(...) __SHFL_UP_GET(__VA_ARGS__, __SHFL_UP_SYNC_4, __SHFL_UP_SYNC_3)(__VA_ARGS__)
-
-// __shfl_xor_sync: support 3-arg and 4-arg calls (HIP ignores mask)
-#define __SHFL_XOR_SYNC_3(mask, var, laneMask)        __shfl_xor(var, laneMask, warpSize)
-#define __SHFL_XOR_SYNC_4(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
-#define __SHFL_XOR_GET(_1, _2, _3, _4, NAME, ...) NAME
-#define __shfl_xor_sync(...) __SHFL_XOR_GET(__VA_ARGS__, __SHFL_XOR_SYNC_4, __SHFL_XOR_SYNC_3)(__VA_ARGS__)
-
-// __shfl_down_sync: support 3-arg and 4-arg calls (HIP ignores mask)
-#define __SHFL_DOWN_SYNC_3(mask, var, delta)        __shfl_down(var, delta, warpSize)
-#define __SHFL_DOWN_SYNC_4(mask, var, delta, width) __shfl_down(var, delta, width)
-#define __SHFL_DOWN_GET(_1, _2, _3, _4, NAME, ...) NAME
-#define __shfl_down_sync(...) __SHFL_DOWN_GET(__VA_ARGS__, __SHFL_DOWN_SYNC_4, __SHFL_DOWN_SYNC_3)(__VA_ARGS__)
-#define __all_sync(mask, var) __all(var)
-#define __any_sync(mask, var) __any(var)
-#define __ballot_sync(mask, var) ((uint32_t)__ballot(var))
 #define cublasStrsmBatched hipblasStrsmBatched
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
@@ -63,7 +41,12 @@
 #define cublasHandle_t hipblasHandle_t
 #define cublasSetMathMode(handle, mode) CUBLAS_STATUS_SUCCESS
 #define cublasSetStream hipblasSetStream
+#if HIP_VERSION >= 70000000
+#define cublasSetWorkspace hipblasSetWorkspace
+#endif // HIP_VERSION >= 70000000
 #define cublasSgemm hipblasSgemm
+#define cublasSgemmBatched hipblasSgemmBatched
+#define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasStatus_t hipblasStatus_t
 #define cublasOperation_t hipblasOperation_t
 #define cudaDevAttrCooperativeLaunch hipDeviceAttributeCooperativeLaunch
@@ -71,9 +54,13 @@
 #define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
+#define CUresult hipError_t
+#define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define CUDA_ERROR_OUT_OF_MEMORY hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
@@ -89,6 +76,10 @@
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
@@ -134,10 +125,6 @@
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStreamWaitEvent hipStreamWaitEvent
-#define cudaMemcpyToSymbol hipMemcpyToSymbol
-#define cudaMemcpyFromSymbol hipMemcpyFromSymbol
-#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
-#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaGraphExec_t hipGraphExec_t
 #define cudaGraphNode_t hipGraphNode_t
 #define cudaKernelNodeParams hipKernelNodeParams
@@ -196,9 +183,9 @@
 
 #define __CUDA_ARCH__ 1300
 
-#if defined(__gfx900__) || defined(__gfx906__)
+#if defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
 #define GCN5
-#endif // defined(__gfx900__) || defined(__gfx906__)
+#endif // defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
 
 #if defined(__gfx803__)
 #define GCN4
@@ -207,6 +194,10 @@
 #if defined(GCN5) || defined(GCN4)
 #define GCN
 #endif // defined(GCN5) || defined(GCN4)
+
+#if defined(__gfx950__)
+#define CDNA4
+#endif // defined(__gfx950__)
 
 #if defined(__gfx942__)
 #define CDNA3
@@ -220,21 +211,25 @@
 #define CDNA1
 #endif // defined(__gfx908__)
 
-#if defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
+#if defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
 #define CDNA // For the entire family
-#endif // defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
+#endif // defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
 
 #if defined(__GFX12__)
 #define RDNA4
 #endif // defined(__GFX12__)
 
-#if defined(__GFX11__)
-#define RDNA3
-#endif // defined(__GFX11__)
+#if defined(__gfx1170__) || defined(__gfx1171__)
+#define RDNA4_M
+#endif // defined(__gfx1170__) || defined(__gfx1171__)
 
-#if defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__GFX11__) && !defined(RDNA4_M)
+#define RDNA3
+#endif // defined(__GFX11__) && !defined(RDNA4_M)
+
+#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
 #define RDNA3_5
-#endif // defined(__gfx1150__) || defined(__gfx1151__)
+#endif // defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
 
 #if defined(RDNA3) && !defined(RDNA3_5)
 #define RDNA3_0
@@ -245,13 +240,13 @@
 #define RDNA2
 #endif
 
-#if defined(__gfx1010__) || defined(__gfx1012__)
+#if defined(__gfx1010__) || defined(__gfx1012__) || defined(__gfx1013__)
 #define RDNA1
-#endif // defined(__gfx1010__) || defined(__gfx1012__)
+#endif // defined(__gfx1010__) || defined(__gfx1012__) || defined(__gfx1013__)
 
-#if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
+#if defined(RDNA4) || defined(RDNA4_M) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
 #define RDNA // For the entire family
-#endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
+#endif // defined(RDNA4) || defined(RDNA4_M) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
 
 #ifndef __has_builtin
     #define __has_builtin(x) 0
@@ -259,12 +254,8 @@
 
 typedef __hip_bfloat16 nv_bfloat16;
 typedef __hip_bfloat162 nv_bfloat162;
-
-#if HIP_VERSION >= 60200000
-#include <hip/hip_fp8.h>
 typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
 #define FP8_AVAILABLE
-#endif // HIP_VERSION >= 60200000
 
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
 typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
@@ -289,7 +280,15 @@ static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 }
 
 static __device__ __forceinline__ int __vsub4(const int a, const int b) {
-    return __vsubss4(a, b);
+    // do some small modifications to a and b to make the subtraction not underflow
+    const unsigned int a_large = a | 0x80808080;
+    const unsigned int b_small = b & 0x7f7f7f7f;
+    const unsigned int result_low_7bits = a_large - b_small;
+
+    // if two ops share the same high bit, we should flip the high bit of the result
+    const unsigned int should_flip_high_1bit = (a ^ ~b) & 0x80808080;
+
+    return result_low_7bits ^ should_flip_high_1bit;
 }
 
 static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
@@ -305,13 +304,32 @@ static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigne
 }
 
 static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
-    unsigned int c;
-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
+    const unsigned int x = a ^ b;
+
+    // any non-equal bit in a byte will set the high bit of that byte here
+    // the addition will not overflow in the byte as op1 and op2 are both less than 0x80
+    const unsigned int ne_low_7bits = ((x & 0x7f7f7f7f) + 0x7f7f7f7f) & 0x80808080;
+    const unsigned int ne_high_1bit = x & 0x80808080;
+    const unsigned int ne_any_bit = ne_low_7bits | ne_high_1bit;
+
+    return (ne_any_bit >> 7) * 0xff;
+}
+
+// v_perm_b32 with selector bytes in [0, 7]: 0-3 pick bytes of lo, 4-7 pick bytes of hi.
+static __device__ __forceinline__ uint32_t ggml_hip_perm(const uint32_t hi, const uint32_t lo, const uint32_t sel) {
+#if __has_builtin(__builtin_amdgcn_is_invocable)
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_perm)) {
+        return __builtin_amdgcn_perm(hi, lo, sel);
+    }
+    const uint64_t src = ((uint64_t) hi << 32) | lo;
+    uint32_t res = 0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
+        const uint32_t byte_sel = (sel >> (8 * i)) & 0x07;
+        res |= (uint32_t) ((src >> (8 * byte_sel)) & 0xFF) << (8 * i);
     }
-    return c;
+    return res;
+#else
+    return __builtin_amdgcn_perm(hi, lo, sel);
+#endif // __has_builtin(__builtin_amdgcn_is_invocable)
 }
